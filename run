@@ -1,0 +1,54 @@
+#!/bin/sh
+
+if [ -f ../template_api_node/.env ]; then . ../template_api_node/.env ; fi
+
+
+app_build() {
+  export GOFLAGS="-mod=vendor"
+
+  # export GOOS=linux
+  # export GOARCH=arm64
+  # go build -o pghp-${GOOS}-${GOARCH} cmd/pgproxy/main.go
+
+  # export GOOS=linux
+  # export GOARCH=amd64
+  # go build -o pghp-${GOOS}-${GOARCH} cmd/pgproxy/main.go
+
+  export GOOS=darwin
+  export GOARCH=amd64
+  go build -o pghp-${GOOS}-${GOARCH} cmd/pgproxy/main.go
+}
+
+app_test1() {
+  for i in {1..100000}; do
+    curl --request POST \
+    --url http://localhost:15432/query \
+    --header 'x-api-key: 70E46E04-76B0-49A0-8106-46ABF552F16E' \
+    --data '{
+      "sql": "SELECT firstname,lastname,email FROM tbl_user WHERE POSITION($1 IN firstname) > 0 AND POSITION($2 IN email) > 0 ;",
+      "parms": ["J","@"] }'
+  done
+}
+
+app_test2(){
+  for i in {1..100000}; do
+    curl --request POST \
+    --url http://localhost:15432/query \
+    --header 'x-api-key: 70E46E04-76B0-49A0-8106-46ABF552F16E' \
+    --data '{
+      "sql": "SELECT firstname,lastname,email FROM tbl_user WHERE POSITION($1 IN firstname) > 0 AND POSITION($2 IN email) > 0 ;",
+      "parms": ["S","example"] }'
+  done
+}
+
+if [ "$1" = "prox" ]; then
+  go run cmd/pgproxy/main.go -apikey "70E46E04-76B0-49A0-8106-46ABF552F16E" -dbhost $DB_HOST -dbname $DB_DATABASE -dbuser $DB_USER -dbpass $DB_PASSWORD
+  exit $?
+fi
+
+if [ "$1" = "build" ]; then app_build ; exit $? ; fi
+if [ "$1" = "test1" ]; then app_test1 ; exit $? ; fi
+if [ "$1" = "test2" ]; then app_test2 ; exit $? ; fi
+
+echo "Unknown command"
+
