@@ -5,7 +5,7 @@ curl -d "{\"sql\":\"SELECT firstname,lastname,email FROM tbl_user WHERE POSITION
   "http://localhost:15432/query"
 
 curl -d '{"sql":"SELECT firstname,lastname,email FROM tbl_user WHERE POSITION($1 IN firstname) > 0 AND POSITION($2 IN email) > 0 LIMIT 10;", "parms": ["J","example"] }' \
-  -H "x-api-key: 70E46E04-76B0-49A0-8106-46ABF552F16E" "http://localhost:15432/query"
+  -H "x-api-key: 70E46E04-76B0-49A0-8106-46ABF552F16E" -H "Accept: plain/text" "http://localhost:15432/query"
 */
 import (
 	"context"
@@ -16,11 +16,17 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+const DEFAULT_DB_PORT = 5432
+const DEFAULT_PROXY_PORT = 15432
+const DEFAULT_ROW_SEPERATOR = 30
+const DEFAULT_COL_SEPERATOR = 31
 
 // RequestBody is a struct to represent the JSON request body
 type RequestBody struct {
@@ -40,7 +46,7 @@ type DBConnection struct {
 
 type DatabaseOptions struct {
 	dbHost  string
-	dbPort  string
+	dbPort  int
 	dbName  string
 	dbUser  string
 	dbPass  string
@@ -49,30 +55,35 @@ type DatabaseOptions struct {
 
 type CommandLineOptions struct {
 	dbOptions DatabaseOptions
-	port      string
+	port      int
 	apiKey    string
 }
 
-var globalDBC *DBConnection
-var API_KEY string
+type Globals struct {
+	dbc    *DBConnection
+	apiKey string
+}
 
-const SEPERATOR = "\t"
+var GLOBAL = Globals{
+	dbc:    nil,
+	apiKey: "",
+}
 
 func getCommandLine() CommandLineOptions {
-	dbOptions := DatabaseOptions{dbHost: "", dbPort: "", dbName: "", dbUser: "", dbPass: "", sslMode: ""}
+	dbOptions := DatabaseOptions{dbHost: "", dbPort: 5432, dbName: "", dbUser: "", dbPass: "", sslMode: ""}
 	cmdOptions := CommandLineOptions{dbOptions: dbOptions}
 	dbOpt := &cmdOptions.dbOptions
 
 	flag.StringVar(&dbOpt.dbHost, "dbhost", "", "PostgreSQL host")
-	flag.StringVar(&dbOpt.dbPort, "dbport", "5432", "PostgreSQL Port")
+	flag.IntVar(&dbOpt.dbPort, "dbport", DEFAULT_DB_PORT, "PostgreSQL Port")
 	flag.StringVar(&dbOpt.dbName, "dbname", "", "Database name")
 	flag.StringVar(&dbOpt.dbUser, "dbuser", "", "User name")
 	flag.StringVar(&dbOpt.dbPass, "dbpass", "", "Password")
 	flag.StringVar(&dbOpt.sslMode, "dbsslmode", "disable", "SSL mode")
-	var portNumber int
-	flag.IntVar(&portNumber, "port", 15432, "Proxy lister port")
-	cmdOptions.port = strconv.Itoa(portNumber)
-	flag.StringVar(&cmdOptions.apiKey, "apikey", "", "Proxy lister port")
+
+	flag.IntVar(&cmdOptions.port, "port", DEFAULT_PROXY_PORT, "Proxy lister port")
+	flag.StringVar(&cmdOptions.apiKey, "apikey", "", "API key to protect access")
+
 	flag.Parse()
 
 	if dbOpt.dbHost == "" {
@@ -100,12 +111,27 @@ func getCommandLine() CommandLineOptions {
 }
 
 func dbConnect(dbOpts DatabaseOptions) (*DBConnection, error) {
-	dsn := fmt.Sprintf("postgresql://%s:%s@%s:%s/%s?sslmode=disable",
+	dsn := fmt.Sprintf("postgresql://%s:%s@%s:%d/%s?sslmode=disable",
 		dbOpts.dbUser, dbOpts.dbPass, dbOpts.dbHost, dbOpts.dbPort, dbOpts.dbName)
 
 	ctx := context.Background()
 
-	db, err := pgxpool.New(ctx, dsn)
+	poolConfig, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+
+	// poolConfig.MaxConnLifetime = 30 * time.Second
+	// poolConfig.MaxConnIdleTime = 5 * time.Second
+	// poolConfig.BeforeConnect = func(context.Context, *pgx.ConnConfig) error {
+	// 	fmt.Println("Before connect")
+	// 	return nil
+	// }
+	// poolConfig.BeforeClose = func(*pgx.Conn) {
+	// 	fmt.Println("Closing a connection")
+	// }
+
+	db, err := pgxpool.NewWithConfig(ctx, poolConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -127,30 +153,33 @@ func bytesToUUID(value interface{}) string {
 	return fmt.Sprintf("%x-%x-%x-%x-%x", uuidbytes[0:4], uuidbytes[4:6], uuidbytes[6:8], uuidbytes[8:10], uuidbytes[10:])
 }
 
-func getRowData(rows pgx.Rows, columns []pgconn.FieldDescription) (map[string]interface{}, error) {
+func getRowData(rows pgx.Rows, columns []pgconn.FieldDescription) ([]interface{}, error) {
 	values, err := rows.Values()
 	if err != nil {
 		return nil, err
 	}
 
-	rowData := make(map[string]interface{})
-	for i, value := range values {
-		colName := string(columns[i].Name)
+	var rowData []interface{}
+	valuesLen := len(values)
+	for i := 0; i < valuesLen; i++ {
+		value := values[i]
 		colType := columns[i].DataTypeOID
 		if colType == 2950 {
-			rowData[colName] = bytesToUUID(value)
+			rowData = append(rowData, bytesToUUID(value))
 		} else {
-			rowData[colName] = value
+			rowData = append(rowData, value)
 		}
 	}
 
 	return rowData, nil
 }
 
-func dbQuery(dbc *DBConnection, sql string, parms []string) ([]map[string]interface{}, error) {
+func dbQuery(dbc *DBConnection, sql string, parms []string) ([]interface{}, error) {
 
 	var params []interface{}
-	for _, element := range parms {
+	parmsLen := len(parms)
+	for i := 0; i < parmsLen; i++ {
+		element := parms[i]
 		params = append(params, element)
 	}
 
@@ -160,10 +189,18 @@ func dbQuery(dbc *DBConnection, sql string, parms []string) ([]map[string]interf
 	}
 	defer rows.Close()
 
-	var results []map[string]interface{}
+	var results []interface{}
 
+	// Get column names and make it the first row in the data
 	columns := rows.FieldDescriptions()
+	columnsLen := len(columns)
+	var columnNames []interface{}
+	for i := 0; i < columnsLen; i++ {
+		columnNames = append(columnNames, columns[i].Name)
+	}
+	results = append(results, columnNames)
 
+	// Get data rows
 	rowCount := 0
 	for rows.Next() {
 		rowData, err := getRowData(rows, columns)
@@ -177,13 +214,102 @@ func dbQuery(dbc *DBConnection, sql string, parms []string) ([]map[string]interf
 		return nil, err
 	}
 
-	// Convert results slice to JSON
-	// jsonData, err := json.Marshal(results)
-	// if err != nil {
-	// 	return "Error marshaling JSON", err
-	// }
-
 	return results, nil
+}
+
+func writeCompactJSONOutput(w http.ResponseWriter, rows []interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	var result []interface{}
+
+	// Use first row to get the number of columns
+	firstRow := rows[0].([]interface{})
+	colLen := len(firstRow)
+
+	rowsLen := len(rows)
+	for i := 0; i < rowsLen; i++ {
+		row := rows[i].([]interface{})
+		var newRow []interface{}
+		for c := 0; c < colLen; c++ {
+			value := row[c]
+			newRow = append(newRow, value)
+		}
+		result = append(result, newRow)
+	}
+
+	err := json.NewEncoder(w).Encode(result)
+	if err != nil {
+		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
+	}
+}
+
+func writeJSONOutput(w http.ResponseWriter, rows []interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	var result []map[string]interface{}
+
+	// Use first row to get the number of columns
+	firstRow := rows[0].([]interface{})
+	colLen := len(firstRow)
+
+	rowsLen := len(rows)
+	for i := 1; i < rowsLen; i++ {
+		row := rows[i].([]interface{})
+		newRow := make(map[string]interface{})
+		for c := 0; c < colLen; c++ {
+			colName := firstRow[c].(string)
+			value := row[c]
+			newRow[colName] = value
+		}
+		result = append(result, newRow)
+	}
+
+	err := json.NewEncoder(w).Encode(result)
+	if err != nil {
+		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
+	}
+}
+
+func writeListOutput(w http.ResponseWriter, rows []interface{}, rowSep byte, colSep byte) {
+	w.Header().Set("Content-Type", "plain/text")
+	w.WriteHeader(http.StatusOK)
+
+	var rowString strings.Builder
+
+	// Use first row to get the number of columns
+	firstRow := rows[0].([]interface{})
+	colLen := len(firstRow)
+
+	// Remaining row is data
+	rowsLen := len(rows)
+	for i := 0; i < rowsLen; i++ {
+		row := rows[i].([]interface{})
+		rowString.Reset()
+		for col := 0; col < colLen; col++ {
+			value := row[col]
+			if col > 0 {
+				rowString.WriteByte(colSep)
+			}
+			rowString.WriteString(fmt.Sprintf("%v", value))
+		}
+		rowString.WriteByte(rowSep)
+		w.Write([]byte(rowString.String()))
+	}
+}
+
+func getListSeparators(rowInput string, colInput string) (byte, byte) {
+	rowChar, rowErr := strconv.Atoi(rowInput)
+	if rowErr != nil || !(rowChar >= 0 && rowChar <= 255) {
+		rowChar = DEFAULT_ROW_SEPERATOR
+	}
+	colChar, colErr := strconv.Atoi(colInput)
+	if colErr != nil || !(colChar >= 0 && colChar <= 255) {
+		colChar = DEFAULT_COL_SEPERATOR
+	}
+
+	return byte(rowChar), byte(colChar)
 }
 
 func proxyHandler(w http.ResponseWriter, r *http.Request) {
@@ -192,7 +318,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Header.Get("x-api-key") != API_KEY {
+	if r.Header.Get("x-api-key") != GLOBAL.apiKey {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
@@ -206,7 +332,7 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Process the request and generate response
-	result, err := dbQuery(globalDBC, requestData.Sql, requestData.Parms)
+	result, err := dbQuery(GLOBAL.dbc, requestData.Sql, requestData.Parms)
 	if err != nil {
 		w.Header().Set("Content-Type", "plain/text")
 		w.WriteHeader(http.StatusBadRequest)
@@ -214,41 +340,42 @@ func proxyHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	//fmt.Fprint(w, result)
-
-	if result == nil {
+	if result == nil || len(result) <= 1 {
+		w.Header().Set("Content-Type", "plain/text")
+		w.WriteHeader(http.StatusOK)
 		fmt.Fprint(w, "")
 		return
 	}
 
-	// Encode JSON response
-	err = json.NewEncoder(w).Encode(result)
-	if err != nil {
-		http.Error(w, "Error encoding JSON response", http.StatusInternalServerError)
-		return
+	if r.Header.Get("Accept") == "application/json" {
+		if r.Header.Get("x-compact-json") == "true" {
+			writeCompactJSONOutput(w, result)
+		} else {
+			writeJSONOutput(w, result)
+		}
+	} else {
+		rowChar, colChar := getListSeparators(r.Header.Get("x-rowsep"), r.Header.Get("x-colsep"))
+		writeListOutput(w, result, rowChar, colChar)
 	}
 }
 
 func main() {
 	cmdOptions := getCommandLine()
 
-	API_KEY = cmdOptions.apiKey
-
 	dbc, err := dbConnect(cmdOptions.dbOptions)
 	if err != nil {
 		log.Fatalln(err)
 	}
 
-	globalDBC = dbc
+	// set global variables
+	GLOBAL.dbc = dbc
+	GLOBAL.apiKey = cmdOptions.apiKey
 
-	// Define a handler function
 	http.HandleFunc("/query", proxyHandler)
 
-	fmt.Printf("PGProxy running on port %s\n", cmdOptions.port)
+	fmt.Printf("PGProxy running on port %d\n", cmdOptions.port)
 
-	err = http.ListenAndServe(":"+cmdOptions.port, nil)
+	err = http.ListenAndServe(":"+strconv.Itoa(cmdOptions.port), nil)
 	if err != nil {
 		fmt.Println("Error starting server:", err)
 	}
